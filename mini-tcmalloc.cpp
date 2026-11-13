@@ -105,11 +105,11 @@ private:
 
 
 
-//регион
+//регион(регион - это фактически структура арены только у которой будет расти размер в байтах геометрически)
 struct Region {
     char* base;          // начало (::operator new(size))
     std::size_t size;    // размер в байтах (кратен 4096)
-    std::size_t offset;  // сколько уже занято (bump)
+    std::size_t offset;  // сколько уже занято
     std::vector<std::size_t> pageMap;  // размер size / 4096, все 255
 };
 
@@ -149,24 +149,24 @@ public:
         caches_.reserve(21);
         sizeToClass_.fill(255);
 
+        //заполняем вектор unique_ptr'ами на SlabCache'и по классам из kSizeClasses
         for (std::size_t i = 0; i < 21; ++i) {
             caches_.push_back(std::make_unique<SlabCache>(kSizeClasses[i]));
         }
 
 
         for (std::size_t i = 0; i < 21; ++i) {
-            if (kSizeClasses[i] > 256) break;
+            if (kSizeClasses[i] > 256) break; //выходим из цикла если kSizeClasses[i] > 256 байт т.к. доступ за время O(1) работает только с классами c size <= 256 байт
 
             std::size_t prev = (i == 0) ? 0 : kSizeClasses[i - 1];
 
-            for (std::size_t s = prev + 1; s <= kSizeClasses[i]; s++) {
+            for (std::size_t s = prev + 1; s <= kSizeClasses[i]; s++) { //перебираем все байты от kSizeClasses[i - 1] + 1 до kSizeClasses[i] чтобы добавить все промежуточные значения байтов
                 if (s < sizeToClass_.size()) sizeToClass_[s] = i;
             }
-
         }
     }
 
-    //деструктор удаляющий всю выделенную память
+    //деструктор удаляющий всю выделенную память(в цикле проходимся по всем регионам и удаляем их арены)
     ~CentralCache() { for (auto& r : regions_) ::operator delete(r.base); }
 
 
@@ -199,24 +199,24 @@ public:
                     if (slab) markPages(idx, slab, slabSize); //заполняем страницы
                 }
 
-                if (!slab) return nullptr; //если арена кончилась то выходим из цикла
+                if (!slab) return nullptr; //если арена кончилась то выходим из функции(возвращаем nullptr)
 
                 caches_[idx]->addSlab(slab); //разбиваем ранее выделенный чанк на блоки 
                 continue;
             }
 
             FreeNode* node = static_cast<FreeNode*>(p); //кастуем указатель к узлу FreeNode
-            node->next = nullptr;
+            node->next = nullptr; //указатель на следующий элемент после node = nullptr т.к. мы добавляем его в конец списка
 
-            if (!head) {
+            if (!head) { //если список пустой(добавление первого элемента)
                 head = node;
                 tail = node;
             }
-            else {
+            else { //tail списка указывает на node как на следующий элемент и tail сдвигается
                 static_cast<FreeNode*>(tail)->next = node;
                 tail = node;
             }
-            ++taken;
+            ++taken; //увеличиваем счётчик(чтобы выделить ровно count элементов)
 
         }
 
@@ -225,12 +225,12 @@ public:
 
     }
 
-
+    //освобождаем list с помощью caches_[idx]
     void deallocateBatch(std::size_t idx, void* list) {
-        if (!list) return;
-        std::lock_guard<std::mutex>lock(mutexes_[idx]);
-        FreeNode* cur = static_cast<FreeNode*>(list);
-        while (cur) {
+        if (!list) return;  //выходим из функции если list пуст(освобождать нечего)
+        std::lock_guard<std::mutex>lock(mutexes_[idx]); //для потокобезопасности
+        FreeNode* cur = static_cast<FreeNode*>(list); //временный указатель для движения по списку в цикле
+        while (cur) { //в цикле по очереди освобождаем каждый элемент list
             FreeNode* next = cur->next;
             caches_[idx]->deallocate(cur);
             cur = next;
@@ -240,17 +240,17 @@ public:
 
     //возвращает индекс для нужного caches_[ind] по указателю p
     std::size_t classOfPointer(void* p) {
-        char* pc = static_cast<char*>(p);
+        char* pc = static_cast<char*>(p); //начало указателя p (адрес памяти)
 
         // binary search: найти последний регион, у которого base <= pc
         auto it = std::upper_bound(regions_.begin(), regions_.end(), pc,
             [](char* p, const Region& r) { return p < r.base; });
 
         if (it == regions_.begin()) return 255;   // pc меньше первого региона
-        --it;                                     // предыдущий — наш регион
+        --it;                                     // сдвигаем указатель т.к. нам нужен предыдущий регион
 
-        const Region& r = *it;
-        if (pc < r.base || pc >= r.base + r.size) return 255;   // вне региона
+        const Region& r = *it; //найденный нами регион
+        if (pc < r.base || pc >= r.base + r.size) return 255;   // вне региона(адрес pc < начало арены региона или начало арены региона + её размер < адреса pc)
 
         std::size_t pageInd = (pc - r.base) / 4096;
         if (pageInd >= r.pageMap.size()) return 255;
@@ -259,7 +259,7 @@ public:
 
     }
 
-    //сколько байт использовано всего
+    //сколько байт использовано всего (offset - arena_ у каждого региона)
     std::size_t arenaUsed() const {
         std::size_t total = 0;
         for (auto& r : regions_) {
@@ -285,7 +285,7 @@ private:
 
         // пробуем взять из текущего региона
         if (!regions_.empty()) { //если вектор регионов не пустой
-            Region& cur = regions_.back();
+            Region& cur = regions_.back(); //берем последний регион(текущий)
             if (cur.offset + size <= cur.size) { //если арены региона хватает выделяем память
                 void* ptr = cur.base + cur.offset;
                 cur.offset += size;
@@ -294,14 +294,14 @@ private:
         }
 
 
-        // если нужно добавить новый регион в вектор
+        // если нужно добавить новый регион в вектор(вектор регионов пуст или не хватает памяти в регионе)
         std::size_t newSize = std::max(nextRegionSize_, size);
         char* base = static_cast<char*>(::operator new(newSize));
 
         Region r;
         r.base = base;
         r.size = newSize;
-        r.offset = size;                          // сразу заняли `size`
+        r.offset = size;                          // сразу заняли `size`(сразу сдвинули offset на size байт т.к. мы же их выделили)
         r.pageMap.assign(newSize / 4096, 255);    // все 255
 
         regions_.push_back(std::move(r));
@@ -357,15 +357,17 @@ public:
             FreeNode* node = localFreeLists_[idx];
             localFreeLists_[idx] = localFreeLists_[idx]->next;
             --localCount_[idx];
+
+
+
             return static_cast<void*>(node);
         }
 
         //выделяем новый батч если список localFreeLists_[idx] пуст
         FreeNode* batch = static_cast<FreeNode*>(central_->allocateBatch(idx, kBatchSize));
-        if (!batch) throw std::bad_alloc(); //если арена кончилась бросаем исключение
 
-        std::size_t count = 0;
-        for (FreeNode* cur = batch; cur; cur = cur->next) ++count;
+        std::size_t count = 0; //переменная счетчик для подсчета количества элементов в списке localFreeLists_[idx]
+        for (FreeNode* cur = batch; cur; cur = cur->next) ++count; //движемся по списку в цикле и считаем элементы
         localCount_[idx] = count;
         localFreeLists_[idx] = batch;
 
@@ -379,13 +381,13 @@ public:
     //освобождение памяти
     void deallocate(void* p) {
         std::size_t idx = central_->classOfPointer(p);
-        if (idx == 255) {
+        if (idx == 255) { //если индекса idx нет в PageMap_ который находится в central_
             ::operator delete(p); 
             return;
         }
 
-        FreeNode* node = static_cast<FreeNode*>(p);
-        ++localCount_[idx];
+        FreeNode* node = static_cast<FreeNode*>(p); //кастуем указатель к FreeNode*
+        ++localCount_[idx]; //увеличение счетчика количества элементов списка
 
 
         if (localCount_[idx] > kMaxLocal) { //если превышение по количеству элементов в списке, то отрезаем kBatchSize элементов и освобождаем их память
@@ -396,15 +398,15 @@ public:
                 cur = cur->next;
             }
             if (cur) {
-                FreeNode* rest = cur->next;
-                cur->next = nullptr;
-                central_->deallocateBatch(idx, head);
-                node->next = rest;
-                localFreeLists_[idx] = node;
-                localCount_[idx] -= kBatchSize;
+                FreeNode* rest = cur->next; //новая голова списка(а точнее второй половины списка)
+                cur->next = nullptr; //обнуляем указатель cur чтобы он не указывал на оставшуюся часть списка(для избежания багов)
+                central_->deallocateBatch(idx, head); //освобождаем тот кусок который мы отрезали
+                node->next = rest; //прицепляем тот указатель который нам передали в параметрах
+                localFreeLists_[idx] = node; //теперь делаем его головой списка
+                localCount_[idx] -= kBatchSize; //уменьшаем счетчик количества элементов списка
             }
         }
-        else {
+        else { //в остальных случаях просто прицепляем указатель и всё
             node->next = localFreeLists_[idx];
             localFreeLists_[idx] = node;
         }
@@ -413,9 +415,9 @@ public:
 
 
 private:
-    CentralCache* central_; // аллокатор
+    CentralCache* central_; // центральный аллокатор(общий для всех потоков)
     std::array<FreeNode*, 21> localFreeLists_{}; //массив списков с узлами(для каждого класса свой)
-    std::array<std::size_t, 21> localCount_{}; //количество элементов в списке каждого класса
+    std::array<std::size_t, 21> localCount_{}; //количество элементов в списке каждого класса(счетчики количества элементов)
 
     static constexpr std::size_t kBatchSize = 32; //сколько элементов выделяем при выделении батча
     static constexpr std::size_t kMaxLocal = 64; //сколько максимум элементов может быть в списке localFreeLists_(для всех классов одинаково)
@@ -423,12 +425,17 @@ private:
 
 
 
+
+
+
+
+
 CentralCache globalCentral; //общий для всех потоков
 thread_local ThreadCache tlsCache(&globalCentral); //у каждого потока свой, но все они внутри используют общий globalCentral
 
-void* my_alloc(std::size_t s) { return tlsCache.allocate(s); } //выделение памяти(функция сделана для удобства)
+void* my_alloc(std::size_t s) { return tlsCache.allocate(s); } //выделение памяти(функция сделана для удобства и для тестов)
 
-void  my_free(void* p) { tlsCache.deallocate(p); } //освобождение памяти(функция сделана для удобства)
+void  my_free(void* p) { tlsCache.deallocate(p); } //освобождение памяти(функция сделана для удобства и для тестов)
 
 
 
@@ -459,22 +466,27 @@ public:
     }
 
 private:
+    //выделение памяти
     void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-        thread_local ThreadCache tls(&central_);
+        thread_local ThreadCache tls(&central_);//для каждого потока создаётся свой ThreadCache, который привяжется к этому потоку и в след.раз поток просто использует уже созданный ThreadCache
         ++used_;
         return tls.allocate(bytes);
     }
 
+    //освобождение памяти
     void  do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
-        thread_local ThreadCache tls(&central_);
+        thread_local ThreadCache tls(&central_); //для каждого потока создаётся свой ThreadCache, который привяжется к этому потоку и в след.раз поток просто использует уже созданный ThreadCache
         --used_;
         tls.deallocate(p);
     }
 
+    //сравнение двух ресурсов
     bool  do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
         return this == &other;
     }
 
-    CentralCache central_;
-    std::atomic<std::size_t> used_ = 0;
+    CentralCache central_; //центральный кэш(один на все потоки)
+    std::atomic<std::size_t> used_ = 0; //атомарный счетчик использованных узлов(без мьютексов быстрее)
 };
+
+
