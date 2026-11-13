@@ -105,16 +105,24 @@ private:
 
 
 
+//регион
+struct Region {
+    char* base;          // начало (::operator new(size))
+    std::size_t size;    // размер в байтах (кратен 4096)
+    std::size_t offset;  // сколько уже занято (bump)
+    std::vector<std::size_t> pageMap;  // размер size / 4096, все 255
+};
+
+
+
 
 
 
 class CentralCache {
 public:
     //конструктор
-    CentralCache()
-        : arena_(static_cast<char*>(::operator new(arenaSize_)))
-        , pageMap_(arenaSize_ / 4096, 255) {   // 255 = free/large
-
+    CentralCache(){
+        
         caches_.reserve(21);
         sizeToClass_.fill(255);
 
@@ -136,10 +144,7 @@ public:
     }
 
     //конструктор с параметром
-    CentralCache(std::size_t bytes)
-        : arenaSize_(bytes),
-        arena_(static_cast<char*>(::operator new(arenaSize_)))
-        , pageMap_(arenaSize_ / 4096, 255) {   // 255 = free/large
+    CentralCache(std::size_t bytes) : nextRegionSize_(bytes) {
 
         caches_.reserve(21);
         sizeToClass_.fill(255);
@@ -162,7 +167,7 @@ public:
     }
 
     //деструктор удаляющий всю выделенную память
-    ~CentralCache() { ::operator delete(arena_); }
+    ~CentralCache() { for (auto& r : regions_) ::operator delete(r.base); }
 
 
     //принимает размер блока в байтах а возвращает индекс (для дальнейшего использования)
@@ -187,11 +192,16 @@ public:
             void* p = caches_[idx]->allocate();
             if (!p) { //если в caches_[idx] freeList_ пустой то мы выделяем новый чанк памяти
                 std::size_t slabSize = caches_[idx]->slabSize();
-                void* slab = bumpAlloc(slabSize); //выделяем чанк памяти
+                void* slab = nullptr;
+                {
+                    std::lock_guard<std::mutex>arenaLock(arenaMutex_);
+                    slab = bumpAlloc(slabSize); //выделяем чанк памяти
+                    if (slab) markPages(idx, slab, slabSize); //заполняем страницы
+                }
+
                 if (!slab) return nullptr; //если арена кончилась то выходим из цикла
 
                 caches_[idx]->addSlab(slab); //разбиваем ранее выделенный чанк на блоки 
-                markPages(idx, slab, slabSize); //добавляем новую страницу
                 continue;
             }
 
@@ -230,22 +240,39 @@ public:
 
     //возвращает индекс для нужного caches_[ind] по указателю p
     std::size_t classOfPointer(void* p) {
-        std::size_t pageInd = (reinterpret_cast<char*>(p) - arena_) / 4096;
-        if (pageInd >= pageMap_.size() || pageMap_[pageInd] == 255) {
-            return 255;
-        }
-        return pageMap_[pageInd];
+        char* pc = static_cast<char*>(p);
+
+        // binary search: найти последний регион, у которого base <= pc
+        auto it = std::upper_bound(regions_.begin(), regions_.end(), pc,
+            [](char* p, const Region& r) { return p < r.base; });
+
+        if (it == regions_.begin()) return 255;   // pc меньше первого региона
+        --it;                                     // предыдущий — наш регион
+
+        const Region& r = *it;
+        if (pc < r.base || pc >= r.base + r.size) return 255;   // вне региона
+
+        std::size_t pageInd = (pc - r.base) / 4096;
+        if (pageInd >= r.pageMap.size()) return 255;
+        if (r.pageMap[pageInd] == 255) return 255;
+        return r.pageMap[pageInd];
+
     }
 
-    //геттер возвращающий оффсет арены
-    std::size_t arenaUsed() const { return arenaOffset_; }
+    //сколько байт использовано всего
+    std::size_t arenaUsed() const {
+        std::size_t total = 0;
+        for (auto& r : regions_) {
+            total += r.offset;
+        }
+        return total;
+    }
 
 
 private:
-    std::size_t arenaSize_ = 16 * 1024 * 1024; //размер памяти в байтах
-    char* arena_ = nullptr; //память
-    std::size_t arenaOffset_ = 0; //оффсет
-    std::vector <std::size_t> pageMap_; //для работы со страницами
+    std::vector<Region> regions_;        // регионы в порядке добавления (отсортированы по base)
+    std::size_t nextRegionSize_ = 16 * 1024 * 1024;  // следующий размер
+    std::mutex arenaMutex_;              // защита regions_ + bumpAlloc + markPages
     std::vector<std::unique_ptr<SlabCache>> caches_; //классы SlabCache с разными размерами блоков
     std::array<std::size_t, 257> sizeToClass_; //по размеру в байтах(индексу) возвращает индекс для нужного класса в caches_
     std::array<std::mutex, 21> mutexes_; //массив мьютексов
@@ -253,18 +280,50 @@ private:
 
     //выделяет один чанк памяти(4096 байт которые потом можно будет разбить на блоки с помощью slabCache_)
     void* bumpAlloc(std::size_t size) {
-        if (arenaOffset_ + size > arenaSize_) return nullptr;
-        void* ptr = arena_ + arenaOffset_;
-        arenaOffset_ += size;
-        return ptr;
+        // выравниваем размер до страницы (4096)
+        size = (size + 4095) & ~std::size_t(4095);
+
+        // пробуем взять из текущего региона
+        if (!regions_.empty()) { //если вектор регионов не пустой
+            Region& cur = regions_.back();
+            if (cur.offset + size <= cur.size) { //если арены региона хватает выделяем память
+                void* ptr = cur.base + cur.offset;
+                cur.offset += size;
+                return ptr;
+            }
+        }
+
+
+        // если нужно добавить новый регион в вектор
+        std::size_t newSize = std::max(nextRegionSize_, size);
+        char* base = static_cast<char*>(::operator new(newSize));
+
+        Region r;
+        r.base = base;
+        r.size = newSize;
+        r.offset = size;                          // сразу заняли `size`
+        r.pageMap.assign(newSize / 4096, 255);    // все 255
+
+        regions_.push_back(std::move(r));
+
+        nextRegionSize_ *= 2;                     // следующий регион вдвое больше
+        return base;
     }
 
     //добавляет новую страницу
     void markPages(std::size_t idx, void* slab, std::size_t slabSize) {
-        std::size_t startPage = (static_cast<char*>(slab) - arena_) / 4096;
-        std::size_t pageCount = slabSize / 4096;
-        for (std::size_t i = 0; i < pageCount; ++i)
-            pageMap_[startPage + i] = idx;
+        char* sc = static_cast<char*>(slab);
+        for (auto& r : regions_) {
+            if (sc >= r.base && sc < r.base + r.size) {
+                std::size_t startPage = (sc - r.base) / 4096;
+                std::size_t pageCount = slabSize / 4096;
+                for (std::size_t i = 0; i < pageCount; ++i)
+                    r.pageMap[startPage + i] = idx;
+                return;
+            }
+        }
+        // не должно случиться — slab выделен из региона
+        assert(false && "slab not in any region");
     }
 
 };
@@ -371,3 +430,51 @@ void* my_alloc(std::size_t s) { return tlsCache.allocate(s); } //выделен�
 
 void  my_free(void* p) { tlsCache.deallocate(p); } //освобождение памяти(функция сделана для удобства)
 
+
+
+
+
+
+
+
+
+
+
+
+//обёртка для STL контейнеров
+class MiniTcmallocResource : public std::pmr::memory_resource {
+public:
+    //конструктор
+    explicit MiniTcmallocResource(std::size_t arenaBytes = 16 * 1024 * 1024) : central_(arenaBytes) {}
+
+    //деструктор
+    ~MiniTcmallocResource() = default;
+
+    // Запрет копирования (memory_resource некопируемый)
+    MiniTcmallocResource(const MiniTcmallocResource&) = delete;
+    MiniTcmallocResource& operator=(const MiniTcmallocResource&) = delete;
+
+    std::size_t used() const {
+        return used_.load();
+    }
+
+private:
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        thread_local ThreadCache tls(&central_);
+        ++used_;
+        return tls.allocate(bytes);
+    }
+
+    void  do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
+        thread_local ThreadCache tls(&central_);
+        --used_;
+        tls.deallocate(p);
+    }
+
+    bool  do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+        return this == &other;
+    }
+
+    CentralCache central_;
+    std::atomic<std::size_t> used_ = 0;
+};
