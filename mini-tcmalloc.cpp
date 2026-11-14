@@ -9,20 +9,14 @@
 #include<limits>
 #include<utility>
 #include<memory>
-#include "httplib.h"
 #include<algorithm>
 #include<iterator>
-#include<list>
-#include<forward_list>
 #include<array>
 #include<deque>
 #include<set>
 #include<map>
 #include <cctype>
 #include <numeric>
-#include<stack>
-#include<queue>
-#include<unordered_map>
 #include <functional>
 #include<cassert>
 #include<thread>
@@ -30,14 +24,105 @@
 #include<chrono>
 #include<stdexcept>
 #include<atomic>
-#include <condition_variable>
 #include<memory_resource>
+
+
+// ─── Платформенная обёртка для выделения памяти ─── (чтобы функции os_alloc и os_free работали и для windows и для Linux)
+#if defined(_WIN32)
+#include <windows.h>
+
+inline void* os_alloc(std::size_t size, bool use_huge_pages = false) {
+    return VirtualAlloc(nullptr, size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE);
+}
+
+inline void os_free(void* ptr) {
+    if (ptr) VirtualFree(ptr, 0, MEM_RELEASE);
+}
+#else
+#include <sys/mman.h>
+
+inline void* os_alloc(std::size_t size, bool use_huge_pages = false) {
+    void* p = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    if (use_huge_pages) madvise(p, size, MADV_HUGEPAGE);
+    return p;
+}
+
+inline void os_free(void* ptr) {
+    if (ptr) munmap(ptr, 0);   // для учебной задачи — size не нужен
+}
+#endif
+
+
+
+
+//для получения NUMA - узла (на один CPU один NUMA - узел)
+#if defined(_WIN32) //для винды
+#include <windows.h>
+
+// Возвращает NUMA-узел текущего потока (0 если не удалось)
+inline unsigned current_numa_node() {
+    PROCESSOR_NUMBER procNum;
+    GetCurrentProcessorNumberEx(&procNum);
+
+    USHORT nodeNumber = 0;
+    if (!GetNumaProcessorNodeEx(&procNum, &nodeNumber)) {
+        return 0;   // fallback
+    }
+    return nodeNumber;
+}
+#else //для линукса
+#include <numa.h>   // libnuma
+inline unsigned current_numa_node() {
+    int cpu = sched_getcpu();
+    int node = numa_node_of_cpu(cpu);
+    return node < 0 ? 0 : static_cast<unsigned>(node);
+}
+#endif
+
+
+
+
+
+
+//тот же os_alloc, только с NUMA - node
+#if defined(_WIN32)
+inline void* os_alloc_on_node(std::size_t size, unsigned node) {
+    return VirtualAllocExNuma(
+        GetCurrentProcess(),
+        nullptr,
+        size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+        node);   // ← номер NUMA-узла
+}
+#else
+inline void* os_alloc_on_node(std::size_t size, unsigned node) {
+    // libnuma: numa_alloc_onnode выделяет на узле
+    void* p = numa_alloc_onnode(size, node);
+    if (p && size >= 2 * 1024 * 1024) {
+        // huge pages на Linux для numa нужны отдельно — упрощаем
+    }
+    return p;
+}
+#endif
+
+
+
+
+
+
+
+
 
 
 struct FreeNode { FreeNode* next; }; //структура узла
 
 
-
+//взят для примера
 constexpr std::size_t kSizeClasses[] = {
     8, 16, 32, 48, 64, 80, 96, 112, 128,
     192, 256, 320, 384, 448, 512,
@@ -46,7 +131,7 @@ constexpr std::size_t kSizeClasses[] = {
 
 
 
-//типо пула только с принимаемым размеров блоков
+//хранит в себе freeList и узлы в нём(сам ничего не выделяет - только хранит)
 class SlabCache {
 public:
     //запрет копирования
@@ -58,7 +143,7 @@ public:
 
     //конструктор с параметрами
     explicit SlabCache(std::size_t blockSize) {
-        blockSize_ = std::max(blockSize, sizeof(FreeNode*));
+        blockSize_ = (std::max)(blockSize, sizeof(FreeNode*));
         assert(blockSize_ <= slabSize_);
     }
 
@@ -105,12 +190,20 @@ private:
 
 
 
-//регион(регион - это фактически структура арены только у которой будет расти размер в байтах геометрически)
+
+
+
+
+
+
+
+//регион(регион - это фактически структура арены только у которой будет расти размер в байтах геометрически при нехватки предыдущей арены)     (для использования в CentralCache)
 struct Region {
-    char* base;          // начало (::operator new(size))
-    std::size_t size;    // размер в байтах (кратен 4096)
-    std::size_t offset;  // сколько уже занято
+    char* base = nullptr;          // начало (::operator new(size))
+    std::size_t size = 0;    // размер в байтах (кратен 4096)
+    std::size_t offset = 0;  // сколько уже занято(сначала всегда 0, если еще не брали память)
     std::vector<std::size_t> pageMap;  // размер size / 4096, все 255
+    unsigned numa_node = 0; // NUMA - node
 };
 
 
@@ -118,6 +211,12 @@ struct Region {
 
 
 
+
+
+
+
+
+//один общий для всех потоков
 class CentralCache {
 public:
     //конструктор
@@ -167,7 +266,11 @@ public:
     }
 
     //деструктор удаляющий всю выделенную память(в цикле проходимся по всем регионам и удаляем их арены)
-    ~CentralCache() { for (auto& r : regions_) ::operator delete(r.base); }
+    ~CentralCache() { 
+        for (auto& r : regions_) {
+            os_free(r.base);
+        }
+    }
 
 
     //принимает размер блока в байтах а возвращает индекс (для дальнейшего использования)
@@ -278,35 +381,43 @@ private:
     std::array<std::mutex, 21> mutexes_; //массив мьютексов
     
 
+
     //выделяет один чанк памяти(4096 байт которые потом можно будет разбить на блоки с помощью slabCache_)
     void* bumpAlloc(std::size_t size) {
-        // выравниваем размер до страницы (4096)
-        size = (size + 4095) & ~std::size_t(4095);
+        size = (size + 4095) & ~std::size_t(4095); // выравниваем размер до страницы (4096)
+
+        unsigned node = current_numa_node();   // ← узел текущего потока
 
         // пробуем взять из текущего региона
-        if (!regions_.empty()) { //если вектор регионов не пустой
-            Region& cur = regions_.back(); //берем последний регион(текущий)
-            if (cur.offset + size <= cur.size) { //если арены региона хватает выделяем память
-                void* ptr = cur.base + cur.offset;
-                cur.offset += size;
+        for (auto& r : regions_) { //ищем подходящий регион(у которого хватает памяти и узел потока совпадает с текущим)
+            if (r.offset + size <= r.size && r.numa_node == node) {
+                void* ptr = r.base + r.offset;
+                r.offset += size;
                 return ptr;
             }
         }
 
 
         // если нужно добавить новый регион в вектор(вектор регионов пуст или не хватает памяти в регионе)
-        std::size_t newSize = std::max(nextRegionSize_, size);
-        char* base = static_cast<char*>(::operator new(newSize));
+        std::size_t newSize = (std::max)(nextRegionSize_, size);
+
+        char* base = static_cast<char*>(os_alloc_on_node(newSize, node));
+
+        // Fallback: если NUMA не поддерживает этот узел — обычный os_alloc
+        if (!base) base = static_cast<char*>(os_alloc(newSize));
+        if (!base) return nullptr; //если не хватило памяти(на уровне системных вызовов)
 
         Region r;
         r.base = base;
         r.size = newSize;
-        r.offset = size;                          // сразу заняли `size`(сразу сдвинули offset на size байт т.к. мы же их выделили)
+        r.offset = size;                          // сразу заняли size (сразу сдвинули offset на size байт т.к. мы же их выделили)
         r.pageMap.assign(newSize / 4096, 255);    // все 255
+        r.numa_node = node;
 
         regions_.push_back(std::move(r));
 
-        nextRegionSize_ *= 2;                     // следующий регион вдвое больше
+        nextRegionSize_ *= 2;                     // следующий регион вдвое больше (геометрический рост)
+
         return base;
     }
 
@@ -333,7 +444,7 @@ private:
 
 
 
-
+//у каждого потока свой TreadCache, но все они используют общий CentralCache
 class ThreadCache {
 public:
     //конструктор
@@ -488,5 +599,4 @@ private:
     CentralCache central_; //центральный кэш(один на все потоки)
     std::atomic<std::size_t> used_ = 0; //атомарный счетчик использованных узлов(без мьютексов быстрее)
 };
-
 
