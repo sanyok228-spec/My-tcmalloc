@@ -114,12 +114,18 @@ inline void* os_alloc_on_node(std::size_t size, unsigned node) {
 
 
 
+constexpr std::uint32_t kFreeMagic = 0xDEADBEEF;   // блок в free-list
+constexpr std::uint32_t kUsedMagic = 0xCAFEBABE;   // блок выдан клиенту
 
 
 
 
-
-struct FreeNode { FreeNode* next; }; //структура узла
+struct FreeNode {   //структура узла
+    FreeNode* next;  
+#ifdef _DEBUG
+    std::uint32_t magic;
+#endif
+};
 
 
 //взят для примера
@@ -143,23 +149,41 @@ public:
 
     //конструктор с параметрами
     explicit SlabCache(std::size_t blockSize) {
+    #ifdef _DEBUG
+        blockSize_ = (std::max)(blockSize, sizeof(FreeNode));
+    #else
         blockSize_ = (std::max)(blockSize, sizeof(FreeNode*));
+    #endif
         assert(blockSize_ <= slabSize_);
     }
 
     //выделение памяти
-    void* allocate() {     
-        if (freeList_ == nullptr) return nullptr;
-        FreeNode* node = freeList_;
-        freeList_ = node->next;
-        void* ptr = static_cast<void*>(node);
-        return ptr;
+    void* allocate() {
+        for (auto& sl : slabs_) { //проходимся по всем чанкам
+            if (sl.freeList) { //если freeList чанка не пустой, то берем один узел
+                void* ptr = reinterpret_cast<void*>(sl.freeList);
+                sl.freeList = sl.freeList->next;
+                ++sl.used;
+                return ptr;
+            }
+        }
+        //если у всех чанков freeList пустой то возвращаем nullptr
+        return nullptr;
     }
     //освобождение памяти
     void deallocate(void* p) {
-        FreeNode* node = static_cast<FreeNode*>(p);
-        node->next = freeList_;
-        freeList_ = node;
+        for (auto sl = slabs_.begin(); sl != slabs_.end(); sl++) {
+            char* begin = reinterpret_cast<char*>(sl->base);
+            char* end = reinterpret_cast<char*>(sl->base + slabSize_);
+            if (static_cast<char*>(p) >= begin && static_cast<char*>(p) < end) { //если указатель из этого чанка
+                FreeNode* node = reinterpret_cast<FreeNode*>(p);
+                node->next = sl->freeList;
+                sl->freeList = node;
+                --sl->used;
+                return;
+            }
+        }
+        assert(false && "block not in any slab");
     }
 
 
@@ -169,22 +193,50 @@ public:
 
     //принимает кусок памяти и разбивает ее на блоки и кладет их в freeList_
     void addSlab(void* raw) {
-        char* start = static_cast<char*>(raw);
+        SlabInfo newSlab;
+        newSlab.base = static_cast<char*>(raw);
         std::size_t Count = slabSize_ / blockSize_;
         for (std::size_t i = 0; i < Count; i++) {
-            FreeNode* node = reinterpret_cast<FreeNode*>(start + i * blockSize_);
-            node->next = freeList_;
-            freeList_ = node;
+            FreeNode* node = reinterpret_cast<FreeNode*>(newSlab.base + i * blockSize_);
+
+        #ifdef _DEBUG
+            node->magic = kFreeMagic;
+        #endif
+
+            node->next = newSlab.freeList;
+            newSlab.freeList = node;
+        }
+        slabs_.push_back(std::move(newSlab));
+    }
+
+
+    //для всех неиспользуемых чанков вызывает колбэк и удаляет из вектора чанков(slabs_)
+    void returnEmptySlabs(const std::function<void(void*, std::size_t)>& func) {
+        for (auto sl = slabs_.begin(); sl != slabs_.end();) {
+            if (sl->used == 0 && slabs_.size() > 1) {
+                func(sl->base, slabSize_);
+                sl = slabs_.erase(sl);
+            }
+            else {
+                ++sl;
+            }
         }
     }
+
 
 private:
 
     std::size_t blockSize_ = 0; //размер одного блока
-    std::size_t slabSize_ = 4096;  //размер одного чанка
-    FreeNode* freeList_ = nullptr; //список с блоками памяти
+    std::size_t slabSize_ = 4096;  //размер одного чанка (slab)    фиксированный
 
-
+    
+    //структура чанка
+    struct SlabInfo {
+        char* base = nullptr;                    // начало slab
+        std::size_t used = 0;          // сколько блоков выдано
+        FreeNode* freeList = nullptr;  // свободные блоки ЭТОГО slab
+    };
+    std::vector<SlabInfo> slabs_;      // активные slabs
     
 };
 
@@ -330,6 +382,7 @@ public:
 
     //освобождаем list с помощью caches_[idx]
     void deallocateBatch(std::size_t idx, void* list) {
+
         if (!list) return;  //выходим из функции если list пуст(освобождать нечего)
         std::lock_guard<std::mutex>lock(mutexes_[idx]); //для потокобезопасности
         FreeNode* cur = static_cast<FreeNode*>(list); //временный указатель для движения по списку в цикле
@@ -338,6 +391,13 @@ public:
             caches_[idx]->deallocate(cur);
             cur = next;
         }
+
+
+        caches_[idx]->returnEmptySlabs([this](void* slab, std::size_t size) {
+            std::lock_guard<std::mutex> arenaLock(arenaMutex_);
+            freeSlab(slab, size);
+            });
+
     }
 
 
@@ -371,20 +431,45 @@ public:
         return total;
     }
 
+    std::size_t freeSlabCount() const {
+        return freeSlabs_.size();
+    }
+
 
 private:
+
+    struct FreeSlab {
+        void* base;
+        std::size_t size;
+    };
+
+
     std::vector<Region> regions_;        // регионы в порядке добавления (отсортированы по base)
     std::size_t nextRegionSize_ = 16 * 1024 * 1024;  // следующий размер
     std::mutex arenaMutex_;              // защита regions_ + bumpAlloc + markPages
     std::vector<std::unique_ptr<SlabCache>> caches_; //классы SlabCache с разными размерами блоков
     std::array<std::size_t, 257> sizeToClass_; //по размеру в байтах(индексу) возвращает индекс для нужного класса в caches_
-    std::array<std::mutex, 21> mutexes_; //массив мьютексов
+    std::array<std::mutex, 21> mutexes_; //массив мьютексов (для каждого класса свой)
+    std::vector<FreeSlab> freeSlabs_;   // под arenaMutex_
     
 
 
     //выделяет один чанк памяти(4096 байт которые потом можно будет разбить на блоки с помощью slabCache_)
     void* bumpAlloc(std::size_t size) {
         size = (size + 4095) & ~std::size_t(4095); // выравниваем размер до страницы (4096)
+
+        // 1. Ищем в freeSlabs_
+
+        for (auto it = freeSlabs_.begin(); it != freeSlabs_.end(); ++it) {
+            if (it->size >= size) {
+                void* p = it->base;
+                freeSlabs_.erase(it);   // или пометить как использованный
+                return p;
+            }
+        }
+
+
+        // 2. Ищем в регионах 
 
         unsigned node = current_numa_node();   // ← узел текущего потока
 
@@ -437,6 +522,13 @@ private:
         assert(false && "slab not in any region");
     }
 
+
+    //ищет регион из которого был выделен чанк и смещает его оффсет (вернули чанк в арену)
+    void freeSlab(void* slab, std::size_t size) {
+        freeSlabs_.push_back({ slab, size });
+    }
+
+
 };
 
 
@@ -469,6 +561,9 @@ public:
             localFreeLists_[idx] = localFreeLists_[idx]->next;
             --localCount_[idx];
 
+        #ifdef _DEBUG
+            node->magic = kUsedMagic;
+        #endif
 
 
             return static_cast<void*>(node);
@@ -486,6 +581,11 @@ public:
         FreeNode* node = localFreeLists_[idx];
         localFreeLists_[idx] = localFreeLists_[idx]->next;
         --localCount_[idx];
+
+    #ifdef _DEBUG
+        node->magic = kUsedMagic;
+    #endif
+
         return static_cast<void*>(node);
     }
 
@@ -499,6 +599,16 @@ public:
 
         FreeNode* node = static_cast<FreeNode*>(p); //кастуем указатель к FreeNode*
         ++localCount_[idx]; //увеличение счетчика количества элементов списка
+
+    #ifdef _DEBUG
+        if (node->magic != kUsedMagic) {
+            std::fprintf(stderr,
+                "[tcmalloc] invalid free: p=%p magic=%08x (expected %08x)\n",
+                p, node->magic, kUsedMagic);
+            std::abort();
+        }
+        node->magic = kFreeMagic;
+    #endif
 
 
         if (localCount_[idx] > kMaxLocal) { //если превышение по количеству элементов в списке, то отрезаем kBatchSize элементов и освобождаем их память
@@ -599,4 +709,5 @@ private:
     CentralCache central_; //центральный кэш(один на все потоки)
     std::atomic<std::size_t> used_ = 0; //атомарный счетчик использованных узлов(без мьютексов быстрее)
 };
+
 
